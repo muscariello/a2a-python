@@ -1,7 +1,7 @@
 import json
 import logging
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 from uuid import uuid4
 
@@ -174,13 +174,18 @@ class JsonRpcTransport(ClientTransport):
             **modified_kwargs,
         ) as event_source:
             try:
+                event_source.response.raise_for_status()
                 async for sse in event_source.aiter_sse():
+                    if not sse.data:
+                        continue
                     response = SendStreamingMessageResponse.model_validate(
                         json.loads(sse.data)
                     )
                     if isinstance(response.root, JSONRPCErrorResponse):
                         raise A2AClientJSONRPCError(response.root)
                     yield response.root.result
+            except httpx.HTTPStatusError as e:
+                raise A2AClientHTTPError(e.response.status_code, str(e)) from e
             except SSEError as e:
                 raise A2AClientHTTPError(
                     400, f'Invalid SSE response or protocol error: {e}'
@@ -376,6 +381,7 @@ class JsonRpcTransport(ClientTransport):
         *,
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
+        signature_verifier: Callable[[AgentCard], None] | None = None,
     ) -> AgentCard:
         """Retrieves the agent's card."""
         modified_kwargs = update_extension_header(
@@ -383,9 +389,13 @@ class JsonRpcTransport(ClientTransport):
             extensions if extensions is not None else self.extensions,
         )
         card = self.agent_card
+
         if not card:
             resolver = A2ACardResolver(self.httpx_client, self.url)
-            card = await resolver.get_agent_card(http_kwargs=modified_kwargs)
+            card = await resolver.get_agent_card(
+                http_kwargs=modified_kwargs,
+                signature_verifier=signature_verifier,
+            )
             self._needs_extended_card = (
                 card.supports_authenticated_extended_card
             )
@@ -410,9 +420,13 @@ class JsonRpcTransport(ClientTransport):
         )
         if isinstance(response.root, JSONRPCErrorResponse):
             raise A2AClientJSONRPCError(response.root)
-        self.agent_card = response.root.result
+        card = response.root.result
+        if signature_verifier:
+            signature_verifier(card)
+
+        self.agent_card = card
         self._needs_extended_card = False
-        return self.agent_card
+        return card
 
     async def close(self) -> None:
         """Closes the httpx client."""

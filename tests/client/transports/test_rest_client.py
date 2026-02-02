@@ -3,19 +3,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import respx
 
+from google.protobuf.json_format import MessageToJson
 from httpx_sse import EventSource, ServerSentEvent
 
 from a2a.client import create_text_message_object
+from a2a.client.errors import A2AClientHTTPError
 from a2a.client.transports.rest import RestTransport
 from a2a.extensions.common import HTTP_EXTENSION_HEADER
+from a2a.grpc import a2a_pb2
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
-    AgentSkill,
     MessageSendParams,
     Role,
 )
+from a2a.utils import proto_utils
 
 
 @pytest.fixture
@@ -89,6 +93,64 @@ class TestRestTransportExtensions:
             },
         )
 
+    # Repro of https://github.com/a2aproject/a2a-python/issues/540
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_send_message_streaming_comment_success(
+        self,
+        mock_agent_card: MagicMock,
+    ):
+        """Test that SSE comments are ignored."""
+        async with httpx.AsyncClient() as client:
+            transport = RestTransport(
+                httpx_client=client, agent_card=mock_agent_card
+            )
+            params = MessageSendParams(
+                message=create_text_message_object(content='Hello stream')
+            )
+
+            mock_stream_response_1 = a2a_pb2.StreamResponse(
+                msg=proto_utils.ToProto.message(
+                    create_text_message_object(
+                        content='First part', role=Role.agent
+                    )
+                )
+            )
+            mock_stream_response_2 = a2a_pb2.StreamResponse(
+                msg=proto_utils.ToProto.message(
+                    create_text_message_object(
+                        content='Second part', role=Role.agent
+                    )
+                )
+            )
+
+            sse_content = (
+                'id: stream_id_1\n'
+                f'data: {MessageToJson(mock_stream_response_1, indent=None)}\n\n'
+                ': keep-alive\n\n'
+                'id: stream_id_2\n'
+                f'data: {MessageToJson(mock_stream_response_2, indent=None)}\n\n'
+                ': keep-alive\n\n'
+            )
+
+            respx.post(
+                f'{mock_agent_card.url.rstrip("/")}/v1/message:stream'
+            ).mock(
+                return_value=httpx.Response(
+                    200,
+                    headers={'Content-Type': 'text/event-stream'},
+                    content=sse_content,
+                )
+            )
+
+            results = []
+            async for item in transport.send_message_streaming(request=params):
+                results.append(item)
+
+            assert len(results) == 2
+            assert results[0].parts[0].root.text == 'First part'
+            assert results[1].parts[0].root.text == 'Second part'
+
     @pytest.mark.asyncio
     @patch('a2a.client.transports.rest.aconnect_sse')
     async def test_send_message_streaming_with_new_extensions(
@@ -129,6 +191,45 @@ class TestRestTransportExtensions:
                 'https://example.com/test-ext/v2',
             },
         )
+
+    @pytest.mark.asyncio
+    @patch('a2a.client.transports.rest.aconnect_sse')
+    async def test_send_message_streaming_server_error_propagates(
+        self,
+        mock_aconnect_sse: AsyncMock,
+        mock_httpx_client: AsyncMock,
+        mock_agent_card: MagicMock,
+    ):
+        """Test that send_message_streaming propagates server errors (e.g., 403, 500) directly."""
+        client = RestTransport(
+            httpx_client=mock_httpx_client,
+            agent_card=mock_agent_card,
+        )
+        params = MessageSendParams(
+            message=create_text_message_object(content='Error stream')
+        )
+
+        mock_event_source = AsyncMock(spec=EventSource)
+        mock_response = MagicMock(spec=httpx.Response)
+        mock_response.status_code = 403
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            'Forbidden',
+            request=httpx.Request('POST', 'http://test.url'),
+            response=mock_response,
+        )
+        mock_event_source.response = mock_response
+        mock_event_source.aiter_sse.return_value = async_iterable_from_list([])
+        mock_aconnect_sse.return_value.__aenter__.return_value = (
+            mock_event_source
+        )
+
+        with pytest.raises(A2AClientHTTPError) as exc_info:
+            async for _ in client.send_message_streaming(request=params):
+                pass
+
+        assert exc_info.value.status_code == 403
+
+        mock_aconnect_sse.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_get_card_no_card_provided_with_extensions(
